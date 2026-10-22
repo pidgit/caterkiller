@@ -22,6 +22,7 @@ const PLACEHOLDER_DEFAULTS = {
 };
 
 const LAMPORTS_PER_SOL = 1_000_000_000;
+const PRIORITY_FEE_SOL = 0.00005;
 const ENV_PATH = path.join(__dirname, '.env');
 
 const ENDPOINTS = {
@@ -66,6 +67,8 @@ const state = {
   dcaLastBuyAt: 0,
   pumpPortalApiCalls: 0,
   lastPumpPortalApiCallAt: null,
+  eventsReceived: 0,
+  apiFeesSol: 0,
   statusRenderThrottleMs: 3000,
   lastStatusRenderAt: 0,
   statusRenderLoop: null,
@@ -252,6 +255,12 @@ const fillStateFromEnv = () => {
   state.apiKey = (env.PUMP_API_KEY || '').trim();
   state.publicWallet = (env.PUBLIC_WALLET_KEY || '').trim();
   state.mint = (env.MINT || '').trim();
+  const eventsReceived = Number(env._EVENTS_RECEIVED || 0);
+  state.eventsReceived = Number.isSafeInteger(eventsReceived) && eventsReceived >= 0 ? eventsReceived : 0;
+  state.apiFeesSol = Number(env._API_FEES || 0);
+  if (!Number.isFinite(state.apiFeesSol) || state.apiFeesSol < 0) {
+    state.apiFeesSol = 0;
+  }
   state.dcaIntervalMs = Number(env.DCA_INTERVAL_MS || env.DCA_INTERVAL || 60000);
   const buyAmountFromEnv = Number(
     env.BUY_AMOUNT_SOL || env.BUYAMT_SOL || env.BUYAMT || env.DCA_AMOUNT_SOL || env.DCA_AMOUNT || PLACEHOLDER_DEFAULTS.DCA_SOL,
@@ -273,6 +282,15 @@ const fillStateFromEnv = () => {
 const recordPumpPortalCall = () => {
   state.pumpPortalApiCalls += 1;
   state.lastPumpPortalApiCallAt = Date.now();
+};
+
+const recordPumpPortalEvent = () => {
+  state.eventsReceived += 1;
+  try {
+    writeEnvValue('_EVENTS_RECEIVED', state.eventsReceived);
+  } catch (error) {
+    logWarning('Could not save _EVENTS_RECEIVED to .env: ' + String(error.message || error));
+  }
 };
 
 const fetchCoin = (mint) => {
@@ -350,7 +368,7 @@ const tradeRequest = async (action, mint, amount, denominatedInSol, slippage = 1
     amount,
     denominatedInSol: String(denominatedInSol),
     slippage,
-    priorityFee: 0.00005,
+    priorityFee: PRIORITY_FEE_SOL,
     pool: 'pump',
     skipPreflight: false,
   };
@@ -367,6 +385,11 @@ const tradeRequest = async (action, mint, amount, denominatedInSol, slippage = 1
   if (!res.ok) {
     console.log('PumpPortal error: ' + JSON.stringify(json));
     return null;
+  }
+
+  if (json && json.signature) {
+    state.apiFeesSol += PRIORITY_FEE_SOL;
+    writeEnvValue('_API_FEES', state.apiFeesSol.toFixed(9));
   }
 
   return json;
@@ -906,7 +929,7 @@ const renderStatusBanner = (force = false) => {
     : 'never';
 
   logStatus(
-    '(MSG) Trading ' + getCurrentTokenSymbol() + ' | ' + formatPrice(state.currentPrice, 'SOL') +
+    '(TICK) Trading ' + getCurrentTokenSymbol() + ' | ' + formatPrice(state.currentPrice, 'SOL') +
       ' | last event received: ' + ageText + ' | trade events: ' + state.sessionEventCount,
   );
   state.lastStatusRenderAt = now;
@@ -947,6 +970,7 @@ const showStatus = async () => {
   row('mint', state.mint || '<none>');
   row('price calls', state.pumpPortalApiCalls);
   row('last api call', lastApiCallLabel());
+  row('API fees', formatSolAmount(state.apiFeesSol, 9) + ' SOL (_API_FEES)');
   row('api key', state.apiKey ? 'loaded' : 'missing');
   row('wallet key', state.publicWallet ? 'loaded' : 'missing');
   row('strategy', state.strategy);
@@ -1090,37 +1114,38 @@ const handleStreamMessage = async (event) => {
       return;
     }
 
-    if (state.debug) {
-      console.log('[websocket] raw message:', raw.slice(0, 1500));
+    console.log('[websocket] raw message:', raw.slice(0, 1500));
+
+    let payload;
+    try {
+      payload = JSON.parse(raw);
+    } catch (parseError) {
+      console.log('[websocket] parse ignored:', String(parseError && parseError.message ? parseError.message : parseError));
+      console.log('[websocket] non-json payload:', raw.slice(0, 1500));
+      return;
     }
 
-    const payload = JSON.parse(raw);
     if (!isTradeEvent(payload)) {
       reportServerMessage(payload);
       return;
     }
 
     state.sessionEventCount += 1;
+    recordPumpPortalEvent();
     state.lastWsEventAt = Date.now();
 
     const price = extractTradePrice(payload, state.mint);
     if (!price || price <= 0) {
-      if (state.debug) {
-        debugTradeSignal('websocket event ignored: no usable price in payload | keys=' + Object.keys(payload || {}).slice(0, 10).join(', '));
-      }
+      console.log('[websocket] event ignored: no usable price in payload | keys=' + Object.keys(payload || {}).slice(0, 10).join(', '));
       return;
     }
 
     state.lastPrice = Number(state.currentPrice) > 0 ? state.currentPrice : price;
     state.currentPrice = price;
-    if (state.debug) {
-      debugTradeSignal('websocket price cached: ' + price + ' | keys=' + Object.keys(payload || {}).slice(0, 10).join(', '));
-    }
+    console.log('[websocket] price cached: ' + price + ' | keys=' + Object.keys(payload || {}).slice(0, 10).join(', '));
     await maybeAutoTrade();
   } catch (error) {
-    if (state.debug) {
-      console.log('[websocket] parse ignored:', String(error && error.message ? error.message : error));
-    }
+    console.log('[websocket] handler error:', String(error && error.message ? error.message : error));
   }
 };
 
